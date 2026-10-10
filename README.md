@@ -2,7 +2,7 @@
 
 访问：https://ian-yunqi.github.io/laptop-pusher/
 
-单文件静态控制网页，通过 Sites 网关连接 MQTT 服务。手机和电脑均可访问。
+单文件静态控制网页，通过普通 HTTPS 请求连接 Sites 网关，网关再连接 MQTT 服务。手机和电脑均可访问，无需浏览器建立 WebSocket。
 
 ## 使用
 

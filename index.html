@@ -38,6 +38,7 @@ summary{cursor:pointer;list-style:none}summary::-webkit-details-marker{display:n
 const $=id=>document.getElementById(id), enc=new TextEncoder(), dec=new TextDecoder('utf-8',{fatal:true});
 const names={INIT:'初始化',READY:'已在原点',NEEDS_HOME:'需要回原点',BENCH_READY:'待机',LEAVING_HOME:'正在离开原点',RETURNING_HOME:'正在完成一圈',HOMING:'正在寻找原点',JOGGING:'定时旋转中',SETTLING:'停止后等待',FAULT:'超时故障，请检查机构'};
 const actions=['press','home','forward','reverse','stop'];
+let httpGeneration=0,httpBusy=false,httpLastPoll=0,httpKey='';
 let socket=null,phase='off',rx=new Uint8Array(),commandTopic='',statusTopic='',current=null;
 let statusAt=0,lastRx=0,lastPing=0,phaseAt=0,pendingSeq=0,pendingAt=0,sequence=0;
 function utf(s){const b=enc.encode(s);if(b.length>65535)throw Error('文本过长');return [b.length>>8,b.length&255,...b]}
@@ -55,19 +56,20 @@ function render(){
  if(online){
   $('status').textContent=names[s.state];
   const timed=Number.isInteger(s.turns)&&Number.isInteger(s.runMs)&&s.runMs>0;
-  $('forwardLabel').textContent=timed?`正转约${s.turns===2?'两':s.turns}圈`:'正转';
-  $('reverseLabel').textContent=timed?`反转约${s.turns===2?'两':s.turns}圈`:'反转';
-  $('estimate').textContent=timed?`约 ${s.turns===2?'两':s.turns} 圈 · ${s.runMs/1000} 秒 · 需实测校准`:'旧版固件，请上传两圈版本';
+  $('forwardLabel').textContent=s.customActions?'动作一':timed?`正转约${s.turns===2?'两':s.turns}圈`:'正转';
+  $('reverseLabel').textContent=s.customActions?'动作二':timed?`反转约${s.turns===2?'两':s.turns}圈`:'反转';
+  $('estimate').textContent=s.customActions?'执行主文件定义的动作流程':timed?`约 ${s.turns===2?'两':s.turns} 圈 · ${s.runMs/1000} 秒 · 需实测校准`:'旧版固件，请上传两圈版本';
  }else $('status').textContent=phase==='online'?'等待设备新状态':'点击右上角设置连接';
  $('connect').disabled=phase!=='off';$('disconnect').disabled=phase==='off';
 }
 function disconnect(reason='已断开'){
+ httpGeneration++;httpBusy=false;httpKey='';
  const old=socket;socket=null;phase='off';rx=new Uint8Array();current=null;pendingSeq=0;sequence=0;
  if(old){old.onmessage=old.onclose=old.onerror=old.onopen=null;old.close()}
  $('connection').textContent=reason;render();
 }
 function validStatus(s){
- return s&&Object.hasOwn(names,s.state)&&typeof s.home==='boolean'&&typeof s.sensor==='boolean'&&typeof s.calibrated==='boolean'&&
+ return s&&Object.prototype.hasOwnProperty.call(names,s.state)&&typeof s.home==='boolean'&&typeof s.sensor==='boolean'&&typeof s.calibrated==='boolean'&&
  Number.isInteger(s.neutral)&&s.neutral>=1300&&s.neutral<=1700&&Number.isSafeInteger(s.completed)&&s.completed>=0&&
  /^[a-f0-9]{16}$/.test(s.session)&&Number.isInteger(s.lastSeq)&&s.lastSeq>=0&&s.lastSeq<=4294967295&&
  typeof s.ackOK==='boolean'&&Number.isInteger(s.utc)&&s.utc>=1700000000;
@@ -106,7 +108,7 @@ function receive(data){
   const h=rx[0],body=rx.slice(pos,pos+value);rx=rx.slice(pos+value);onPacket(h,body);
  }
 }
-function connect(){
+function connectWebSocket(){
  try{
   const key=$('key').value;
   if(!key||enc.encode(key).length>64)throw Error('请输入控制密钥');
@@ -127,16 +129,45 @@ function connect(){
   socket.onclose=e=>disconnect(e.code===1008&&e.reason==='Invalid key'?'密钥不正确':'连接已断开，请重新连接。');
  }catch(e){disconnect(e.message)}
 }
-function sendAction(action){
- if(!actions.includes(action)||!usable()||(pendingSeq&&action!=='stop'))return;
- if(sequence>=4294967295){disconnect('指令序号用尽，请重新连接设备。');return}
+// 普通 HTTPS：手机无需建立 WebSocket；密钥只在内存中保存。
+const httpGateway='https://laptop-pusher-gateway.fondpika.chatgpt.site';
+async function httpRequest(path,body,key){
+ const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),14000);
  try{
-  // 使用设备 UTC 加上收到状态后的时间差，避免手机时钟偏差；过期状态禁止操作。
-  const utc=current.utc+Math.floor((Date.now()-statusAt)/1000),seq=++sequence;
-  const body=enc.encode(`${current.session}|${seq}|${utc}|${action}`);
-  send(0x30,[...utf(commandTopic),...body]); // QoS0，retain=false，无重试/离线队列
-  pendingSeq=seq;pendingAt=Date.now();$('message').textContent='已发送，等待设备确认…';render();
- }catch(e){disconnect(e.message)}
+  const response=await fetch(httpGateway+path,{method:body===undefined?'GET':'POST',headers:{'X-Control-Key':key},body,signal:controller.signal,cache:'no-store'});
+  const result=await response.json();
+  if(!response.ok){if(response.status===401)throw Error('密钥不正确');throw Error(result.error==='Device status timeout'?'云端可达，等待设备状态超时':result.error==='Invalid command'?'指令过期，请重新连接':result.error==='Cloud authentication failed'?'后端 MQTT 认证失败':'云端连接暂时失败，请重试');}
+  return result.state;
+ }catch(error){if(error.name==='AbortError')throw Error('连接超时，请重新连接');if(error instanceof TypeError)throw Error('无法访问控制后端，请检查浏览器和网络');throw error;}
+ finally{clearTimeout(timer);}
+}
+function applyHttpState(s){
+ onPacket(0x30,new Uint8Array([...utf(statusTopic),...enc.encode(JSON.stringify(s))]));
+}
+async function connect(){
+ disconnect();httpKey=$('key').value.trim();
+ if(!httpKey){disconnect('请输入控制密钥');return;}
+ const generation=httpGeneration;phase='opening';phaseAt=Date.now();httpBusy=true;
+ commandTopic='pusher/laptop-01/command';statusTopic='pusher/laptop-01/status';
+ $('connection').textContent='正在连接…';$('message').textContent='';render();
+ try{const state=await httpRequest('/api/status',undefined,httpKey);if(generation!==httpGeneration)return;phase='online';applyHttpState(state);}
+ catch(error){if(generation===httpGeneration)disconnect(error.message);}
+ finally{if(generation===httpGeneration){httpBusy=false;httpLastPoll=Date.now();}}
+}
+async function pollHttp(){
+ if(httpBusy||phase!=='online')return;httpBusy=true;const generation=httpGeneration;
+ try{const state=await httpRequest('/api/status',undefined,httpKey);if(generation===httpGeneration)applyHttpState(state);}
+ catch(error){if(generation===httpGeneration)$('connection').textContent=error.message;}
+ finally{if(generation===httpGeneration){httpBusy=false;httpLastPoll=Date.now();}}
+}
+async function sendAction(action){
+ if(!actions.includes(action)||!usable()||(pendingSeq&&action!=='stop'))return;
+ if(sequence>=4294967295){disconnect('指令序号用尽，请重新连接设备');return;}
+ const generation=httpGeneration,seq=++sequence,utc=current.utc+Math.floor((Date.now()-statusAt)/1000);
+ const body=current.session+'|'+seq+'|'+utc+'|'+action;
+ pendingSeq=seq;pendingAt=Date.now();$('message').textContent='已发送，等待设备确认…';render();
+ try{const state=await httpRequest('/api/command',body,httpKey);if(generation===httpGeneration)applyHttpState(state);}
+ catch(error){if(generation===httpGeneration&&pendingSeq===seq){pendingSeq=0;$('message').textContent=error.message+'。指令不会自动重发。';render();}}
 }
 $('connect').addEventListener('click',connect);$('disconnect').addEventListener('click',()=>disconnect());
 $('key').addEventListener('keydown',event=>{if(event.key==='Enter'&&phase==='off')connect()});
@@ -146,8 +177,9 @@ setInterval(()=>{
  if(phase!=='off'&&phase!=='online'&&now-phaseAt>15000){disconnect('连接超时，请检查网络。');return}
  if(phase==='online'){
   if(now-lastRx>25000){disconnect('云端心跳超时，请重新连接。');return}
-  if(now-lastPing>=10000){try{send(0xc0);lastPing=now}catch(e){disconnect(e.message)}}
+  if(socket&&now-lastPing>=10000){try{send(0xc0);lastPing=now}catch(e){disconnect(e.message)}}
  }
+ if(!socket&&phase==='online'&&!httpBusy&&now-httpLastPoll>=2000)pollHttp();
  if(pendingSeq&&now-pendingAt>13000){pendingSeq=0;$('message').textContent='未收到设备确认。指令不会自动重发，请核对状态。'}
  render();
 },500);
