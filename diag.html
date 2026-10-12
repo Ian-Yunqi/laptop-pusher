@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>手机端请求诊断</title>
+<style>
+:root{color-scheme:dark}
+body{margin:0;padding:14px 12px 40px;font:16px/1.55 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;background:#0d1626;color:#e8eef7}
+h1{font-size:18px;margin:2px 0 10px}
+.intro{font-size:13px;color:#93a4bd;margin-bottom:10px}
+.card{border:1px solid #26364f;border-radius:10px;padding:10px 12px;margin:10px 0;background:#131f33}
+.name{font-weight:600}
+.res{margin-top:6px;font-size:14px;word-break:break-word}
+.ok{color:#4ade80}.bad{color:#f87171}.warn{color:#fbbf24}.dim{color:#93a4bd}
+pre{white-space:pre-wrap;word-break:break-all;font-size:12px;margin:6px 0 0;color:#cbd5e1}
+input,button{font:16px/1.4 inherit}
+input{width:100%;padding:10px;border-radius:8px;border:1px solid #2b3d59;background:#0b1220;color:#e8eef7;box-sizing:border-box}
+button{margin:10px 0;padding:12px 16px;border:0;border-radius:9px;background:#2563eb;color:#fff;font-weight:600}
+textarea{width:100%;height:170px;font:12px/1.45 ui-monospace,Consolas,monospace;background:#0b1220;color:#dbe6f5;border:1px solid #2b3d59;border-radius:8px;box-sizing:border-box}
+</style>
+</head>
+<body>
+<h1>手机端请求诊断</h1>
+<div class="intro">本页只读取状态，不会触发任何舵机动作。点下面的按钮，等 30 秒左右，把最后那份报告截图或复制发回即可。</div>
+<div class="card" id="env"></div>
+<div class="card">
+  <div class="name">控制密钥（可留空）</div>
+  <input id="key" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="填入后额外测试正式控制接口（与网页里填的是同一个）">
+  <button id="run">重新运行全部测试</button>
+  <div class="dim">留空时会用一个假密钥，同样能判断请求有没有发出去。</div>
+</div>
+<div id="list"></div>
+<div class="card">
+  <div class="name">完整报告（复制或截图这一段）</div>
+  <textarea id="report" readonly></textarea>
+</div>
+<script>
+(function(){
+"use strict";
+var GW='https://laptop-pusher-gateway.fondpika.chatgpt.site';
+var list=document.getElementById('list'),report=document.getElementById('report'),envBox=document.getElementById('env');
+var lines=[];
+function log(s){lines.push(s);report.value=lines.join('\n');}
+function now(){return Date.now();}
+function q(url){return url+(url.indexOf('?')<0?'?':'&')+'t='+now();}
+function perf(url){
+  try{
+    var es=performance.getEntriesByName(url);
+    if(!es.length)return '资源计时: 无条目（请求可能根本没发出/被拦截）';
+    var e=es[es.length-1];
+    return '资源计时: duration='+Math.round(e.duration)+'ms transferSize='+e.transferSize+' type='+e.initiatorType;
+  }catch(err){return '资源计时: 读取失败 '+err.message;}
+}
+function card(name){
+  var d=document.createElement('div');d.className='card';
+  var h=document.createElement('div');h.className='name';h.textContent=name;
+  var r=document.createElement('div');r.className='res dim';r.textContent='测试中…';
+  d.appendChild(h);d.appendChild(r);list.appendChild(d);
+  return r;
+}
+function done(el,ok,text,extra){
+  el.className='res '+(ok?'ok':'bad');
+  el.textContent=(ok?'通过 · ':'失败 · ')+text;
+  if(extra){var p=document.createElement('pre');p.textContent=extra;el.parentNode.appendChild(p);}
+}
+function env(){
+  var bits=[
+    '地址: '+location.href,
+    '来源 Origin: '+location.origin,
+    'UA: '+navigator.userAgent,
+    '在线: '+navigator.onLine+' · 安全上下文: '+window.isSecureContext,
+    'fetch: '+(typeof fetch)+' · XHR: '+(typeof XMLHttpRequest)+' · AbortController: '+(typeof AbortController),
+    '时间: '+new Date().toString()+' · 时区偏移: '+new Date().getTimezoneOffset()+' 分钟'
+  ];
+  envBox.innerHTML='<div class="name">环境</div><pre>'+bits.join('\n')+'</pre>';
+  lines.push('===== 环境 =====');lines.push(bits.join('\n'));
+}
+function ft(name,url,opts){
+  var el=card(name),t0=now();
+  return fetch(url,opts).then(function(r){
+    return r.text().then(function(t){
+      var head='HTTP '+r.status+' · '+(now()-t0)+'ms · 前 100 字: '+t.slice(0,100);
+      done(el,true,head,perf(url));
+      log('[通过] '+name+' | '+head+' | '+perf(url));
+    });
+  }).catch(function(e){
+    var head=e.name+': '+e.message+' · '+(now()-t0)+'ms';
+    done(el,false,head,perf(url));
+    log('[失败] '+name+' | '+head+' | '+perf(url));
+  });
+}
+function xhr(name,url,key){
+  var el=card(name),t0=now();
+  return new Promise(function(res){
+    var x=new XMLHttpRequest();
+    try{x.open('GET',url,true);if(key!==null)x.setRequestHeader('X-Control-Key',key);x.timeout=20000;}
+    catch(e){done(el,false,'设置请求失败 '+e.name+': '+e.message);log('[失败] '+name+' | 设置请求失败 '+e.name+': '+e.message);return res();}
+    x.onload=function(){
+      var head='HTTP '+x.status+' · '+(now()-t0)+'ms · 前 100 字: '+String(x.responseText).slice(0,100);
+      done(el,x.status>=200&&x.status<500,head,perf(url));
+      log('['+(x.status<500?'通过':'失败')+'] '+name+' | '+head+' | '+perf(url));res();
+    };
+    x.onerror=function(){done(el,false,'onerror 网络层失败 · '+(now()-t0)+'ms',perf(url));log('[失败] '+name+' | onerror · '+perf(url));res();};
+    x.ontimeout=function(){done(el,false,'超时 20s',perf(url));log('[失败] '+name+' | 超时 | '+perf(url));res();};
+    x.send();
+  });
+}
+function imgProbe(name,url){
+  var el=card(name),t0=now();
+  return new Promise(function(res){
+    var im=new Image();
+    var settled=false;
+    im.onload=function(){if(settled)return;settled=true;var h='onload · '+(now()-t0)+'ms';done(el,true,h,perf(url));log('[通过] '+name+' | '+h+' | '+perf(url));res();};
+    im.onerror=function(){if(settled)return;settled=true;var h='onerror · '+(now()-t0)+'ms（图片通道：onerror 可能是解不开图，也可能是请求失败，看下面的计时条目）';done(el,false,h,perf(url));log('[失败] '+name+' | '+h+' | '+perf(url));res();};
+    setTimeout(function(){if(settled)return;settled=true;var h='10s 无响应';done(el,false,h,perf(url));log('[失败] '+name+' | '+h+' | '+perf(url));res();},10000);
+    im.src=url;
+  });
+}
+async function run(){
+  list.innerHTML='';lines=[];report.value='';env();
+  var key=document.getElementById('key').value.trim();
+  var k=(key===''?'zzz-invalid-key':key);
+  log('本次使用的密钥：'+(key===''?'（留空，用假密钥 zzz-invalid-key）':'（已填写）'));
+
+  // 1 同源请求：确认这台手机能不能做最普通的 fetch
+  await ft('1 同源 fetch（本页面 README.md）',q('README.md'),{cache:'no-store'});
+
+  // 2 跨域控制组：GitHub API 带 CORS，验证跨域 fetch 本身是否可用
+  await ft('2 跨域控制组 fetch（api.github.com）','https://api.github.com/zen?t='+now(),{cache:'no-store',headers:{Accept:'text/plain'}});
+
+  // 3 网关同主机、无自定义头、no-cors：只验证网络通道
+  await ft('3 网关 /health（no-cors，无自定义头）',q(GW+'/health'),{mode:'no-cors',cache:'no-store'});
+
+  // 4 网关 /api/status 简单请求（无自定义头，无需预检）
+  await ft('4 网关 /api/status（不带密钥头）',q(GW+'/api/status'),{cache:'no-store'});
+
+  // 5 正式路径：与网页里完全一致的 fetch（自定义头 + 预检 + AbortController）
+  (function(){
+    var ctl=new AbortController(),timer=setTimeout(function(){ctl.abort();},14000);
+    var url=q(GW+'/api/status');
+    ft('5 网关 /api/status（带 X-Control-Key，正式路径）',url,{method:'GET',headers:{'X-Control-Key':k},signal:ctl.signal,cache:'no-store'})
+      .then(function(){clearTimeout(timer);});
+  })();
+
+  // 6 同样的请求改用 XMLHttpRequest
+  await xhr('6 网关 /api/status（XMLHttpRequest 版）',q(GW+'/api/status'),k);
+
+  // 7 图片子资源通道
+  await imgProbe('7 网关 /health 图片探针（子资源通道）',q(GW+'/health'));
+
+  log('===== 报告结束 '+new Date().toLocaleString()+' =====');
+}
+document.getElementById('run').addEventListener('click',function(){run();});
+run();
+})();
+</script>
+</body>
+</html>
