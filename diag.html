@@ -106,8 +106,7 @@ function xhr(name,url,key){
     x.send();
   });
 }
-function imgProbe(name,url){
-  var el=card(name),t0=now();
+function imgProbe(name,url){  var el=card(name),t0=now();
   return new Promise(function(res){
     var im=new Image();
     var settled=false;
@@ -115,6 +114,24 @@ function imgProbe(name,url){
     im.onerror=function(){if(settled)return;settled=true;var h='onerror · '+(now()-t0)+'ms（图片通道：onerror 可能是解不开图，也可能是请求失败，看下面的计时条目）';done(el,false,h,perf(url));log('[失败] '+name+' | '+h+' | '+perf(url));res();};
     setTimeout(function(){if(settled)return;settled=true;var h='10s 无响应';done(el,false,h,perf(url));log('[失败] '+name+' | '+h+' | '+perf(url));res();},10000);
     im.src=url;
+  });
+}
+function whoami(name,url){
+  var el=card(name),t0=now();
+  return fetch(url,{cache:'no-store'}).then(function(r){
+    return r.text().then(function(t){
+      var info;
+      try{
+        var j=JSON.parse(t);
+        info='服务端收到的 Origin = '+JSON.stringify(j.origin)+' · Referer = '+JSON.stringify(j.referer)+' · UA 前 60 字 = '+String(j.ua).slice(0,60);
+      }catch(e){info='响应不是预期 JSON（补丁未发布时该接口返回 404）: '+t.slice(0,80);}
+      done(el,r.ok,info,perf(url));
+      log('['+(r.ok?'通过':'失败')+'] '+name+' | HTTP '+r.status+' | '+info);
+    });
+  }).catch(function(e){
+    var h=e.name+': '+e.message+'（补丁未发布时属正常）';
+    done(el,false,h,perf(url));
+    log('[失败] '+name+' | '+h);
   });
 }
 async function run(){
@@ -148,6 +165,9 @@ async function run(){
 
   // 7 图片子资源通道
   await imgProbe('7 网关 /health 图片探针（子资源通道）',q(GW+'/health'));
+
+  // 8 服务端回声：确认这台浏览器实际发出的 Origin 到底是什么
+  await whoami('8 服务端回声 /api/whoami（看服务端收到的 Origin）',q(GW+'/api/whoami'));
 
   log('===== 报告结束 '+new Date().toLocaleString()+' =====');
 }
